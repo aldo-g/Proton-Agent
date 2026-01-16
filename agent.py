@@ -20,30 +20,50 @@ SEARCH_CRITERIA = 'ALL' # Use 'UNSEEN' for only unread, or 'ALL' for everything 
 
 # Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Use a model confirmed to exist in your environment
+MODEL_NAME = 'models/gemini-2.0-flash'
+
+try:
+    model = genai.GenerativeModel(MODEL_NAME)
+except Exception as e:
+    print(f"Could not initialize {MODEL_NAME}, trying fallback. Error: {e}")
+    model = genai.GenerativeModel('models/gemini-flash-latest')
 
 def get_email_category(subject, sender, body_snippet):
     prompt = f"""
-    You are an AI email sorter. Categorize the following email into a single folder name (one or two words).
-    If it's an invoice, call it 'Invoices'. 
-    If it's a newsletter, call it 'Newsletters'.
-    If it's personal, call it 'Personal'.
-    If it's work-related, call it 'Work'.
-    If it doesn't fit these, create a specific but concise folder name.
+    You are an AI email sorter. Categorize the following email into a single folder name.
+    
+    If you are unsure, if it's a notification from a system, or if it doesn't fit a clear category, return 'SKIP'.
 
-    Subject: {subject}
+    RULES:
+    - Use ONE or TWO words max.
+    - No special characters (only letters and underscores).
+    - 'Invoices' for receipts or tax documents.
+    - 'Newsletters' for marketing/bulk/subscriptions.
+    - 'Personal' for direct personal mail from humans.
+    - 'Work' for professional/job-related items.
+    - 'Travel' for bookings/itineraries.
+
+    Email Subject: {subject}
     From: {sender}
-    Snippet: {body_snippet}
+    Content Snippet: {body_snippet}
 
-    Return ONLY the folder name. No other text.
+    Return ONLY the folder name or 'SKIP'. Do not include any other text.
     """
     try:
         response = model.generate_content(prompt)
-        category = response.text.strip().replace(' ', '_') # Use underscores for IMAP folders if needed
-        return category
+        category = response.text.strip().replace(' ', '_').replace('"', '').replace("'", "")
+        # Remove trailing/leading underscores or weird chars
+        category = ''.join(e for e in category if e.isalnum() or e == '_')
+        
+        if category.upper() == 'SKIP' or len(category) < 2:
+            return None
+            
+        return f"Folders/{category}"
     except Exception as e:
         print(f"Error calling Gemini: {e}")
-        return "Uncategorized"
+        return None
 
 def process_emails():
     print(f"Connecting to {HOST}:{PORT}...")
@@ -56,40 +76,68 @@ def process_emails():
             messages = client.search([SEARCH_CRITERIA])
             print(f"Found {len(messages)} emails matching criteria '{SEARCH_CRITERIA}'.")
 
-            for msg_id, data in client.fetch(messages, ['ENVELOPE', 'RFC822']).items():
-                envelope = data[b'ENVELOPE']
-                subject = envelope.subject.decode() if envelope.subject else "No Subject"
-                sender = str(envelope.from_[0])
-                
-                # Extract body snippet
-                raw_email = data[b'RFC822']
-                msg = email.message_from_bytes(raw_email, policy=policy.default)
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_content()
-                            break
-                else:
-                    body = msg.get_content()
-                
-                snippet = body[:500] # Limit to 500 chars for the LLM
-                
-                print(f"Processing: {subject} from {sender}")
-                category = get_email_category(subject, sender, snippet)
-                print(f"Category: {category}")
+            for msg_id, data in client.fetch(messages, ['ENVELOPE', 'BODY.PEEK[]']).items():
+                try:
+                    envelope = data[b'ENVELOPE']
+                    subject = envelope.subject.decode() if envelope.subject else "No Subject"
+                    sender = str(envelope.from_[0])
+                    
+                    # Extract body snippet
+                    raw_email = data.get(b'BODY.PEEK[]') or data.get(b'BODY[]') or data.get(b'RFC822')
+                    if not raw_email:
+                        continue
 
-                # Create folder if it doesn't exist
-                if not client.folder_exists(category):
-                    print(f"Creating folder: {category}")
-                    client.create_folder(category)
+                    msg = email.message_from_bytes(raw_email, policy=policy.default)
+                    body = ""
+                    try:
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    body = part.get_content()
+                                    break
+                        else:
+                            body = msg.get_content()
+                    except:
+                        body = "Could not parse body"
+                    
+                    snippet = str(body)[:500]
+                    
+                    print(f"Processing: {subject} from {sender}")
+                    category = get_email_category(subject, sender, snippet)
+                    
+                    if not category:
+                        print(f"Skipping: No clear category for '{subject}'. Keeping in Inbox.")
+                        continue
 
-                # Move email
-                client.move([msg_id], category)
-                print(f"Moved email {msg_id} to {category}")
+                    print(f"Category identified: {category}")
+
+                    # Create folder if it doesn't exist
+                    try:
+                        # Standardize folder name to Title Case like 'Folders/Work'
+                        parts = category.split('/')
+                        if len(parts) > 1:
+                            parts[1] = parts[1].capitalize()
+                            category = '/'.join(parts)
+                        
+                        if not client.folder_exists(category):
+                            print(f"Creating folder: {category}")
+                            client.create_folder(category)
+                    except Exception as fe:
+                        print(f"Could not create folder {category}: {fe}. Keeping in Inbox.")
+                        continue
+
+                    # Explicitly ensure the email is marked as UNREAD before moving
+                    client.remove_flags([msg_id], [b'\\Seen'])
+                    
+                    # Move email
+                    client.move([msg_id], category)
+                    print(f"Moved email {msg_id} to {category} (marked as UNREAD)")
+                except Exception as ee:
+                    print(f"Error processing specific email {msg_id}: {ee}")
+                    continue
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"A connection error occurred: {e}")
 
 if __name__ == "__main__":
     if not all([USERNAME, PASSWORD, GEMINI_API_KEY]):
